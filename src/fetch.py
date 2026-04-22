@@ -351,3 +351,82 @@ def build_dataset(cache: bool = True) -> pd.DataFrame:
     base.to_parquet(cache_path, index=False)
     print(f"\n[fetch] Saved: {len(base)} municipalities, {len(base.columns)} columns")
     return base
+
+
+# ---------------------------------------------------------------------------
+# Temporal fetch -- year-tagged builds
+# ---------------------------------------------------------------------------
+
+# Year specifications for temporal analysis.
+# AUP01 (unemployment) only starts from 2017M07, so 2017 is our baseline.
+YEAR_SPECS = {
+    "2017": {
+        "folk1a": "2017K1",
+        "aup01":  "2017M07",
+        "indkp":  "2017",
+        "hfudd":  "2017",
+        "bol":    "2017",
+    },
+    "2023": {
+        "folk1a": "2024K1",
+        "aup01":  "2024M01",
+        "indkp":  "2022",     # income stats lag ~2 years
+        "hfudd":  "2023",
+        "bol":    "2023",
+    },
+}
+
+
+def build_dataset_for_year(year_tag: str, cache: bool = True) -> pd.DataFrame:
+    """
+    Fetches and assembles the full municipality dataset for a given year tag.
+
+    year_tag must be a key in YEAR_SPECS, e.g. "2017" or "2023".
+    Data is cached to data/municipalities_{year_tag}.parquet.
+    """
+    if year_tag not in YEAR_SPECS:
+        raise ValueError(f"Unknown year_tag '{year_tag}'. Choose from {list(YEAR_SPECS)}")
+
+    spec       = YEAR_SPECS[year_tag]
+    cache_path = DATA_DIR / f"municipalities_{year_tag}.parquet"
+    DATA_DIR.mkdir(exist_ok=True)
+
+    if cache and cache_path.exists():
+        print(f"[fetch] {year_tag}: loading from cache...")
+        return pd.read_parquet(cache_path)
+
+    print(f"\n[fetch] Fetching {year_tag} data...")
+
+    steps = [
+        ("Population",   lambda: fetch_population(year=spec["folk1a"])),
+        ("Unemployment", lambda: fetch_unemployment(year_month=spec["aup01"])),
+        ("Income",       lambda: fetch_income(year=spec["indkp"])),
+        ("Education",    lambda: fetch_education(year=spec["hfudd"])),
+        ("Housing",      lambda: fetch_housing(year=spec["bol"])),
+    ]
+
+    base   = None
+    failed = []
+    for name, fn in steps:
+        print(f"  [{year_tag}] {name}...")
+        try:
+            df = fn()
+            base = df if base is None else base.merge(df, on="OMRÅDE", how="outer")
+        except Exception as e:
+            print(f"  [{year_tag}] WARNING {name}: {e}")
+            failed.append(name)
+
+    if base is None or len(base) == 0:
+        raise RuntimeError(f"No data for {year_tag}. Failed: {failed}")
+
+    if failed:
+        print(f"  [{year_tag}] Partial: {failed} missing")
+
+    base["municipality_code"] = base["OMRÅDE"].astype(str).str.zfill(4)
+    from src.municipalities import annotate
+    base = annotate(base)
+    base = base[base["OMRÅDE"].isin(VALID_CODES)].copy()
+
+    base.to_parquet(cache_path, index=False)
+    print(f"  [{year_tag}] Saved: {len(base)} municipalities")
+    return base
