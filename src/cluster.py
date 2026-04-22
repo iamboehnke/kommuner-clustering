@@ -50,18 +50,20 @@ FEATURE_LABELS = {
 }
 
 
-def prepare_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+def prepare_features(df: pd.DataFrame) -> tuple:
     """
     Extracts, imputes, and scales the feature matrix from the raw dataset.
-
-    Returns (X_scaled, municipality_names) where X_scaled has one row per
-    municipality, aligned to the rows in df.
-
-    Missing values are imputed with the column median before scaling.
-    Median imputation is appropriate here because some smaller municipalities
-    may have suppressed values in the DST tables.
+    Only uses features that are actually present in the DataFrame, so the
+    pipeline works correctly when some DST tables fail to load.
     """
-    X_raw = df[FEATURE_COLS].copy()
+    available = [c for c in FEATURE_COLS if c in df.columns]
+    missing   = [c for c in FEATURE_COLS if c not in df.columns]
+
+    if missing:
+        print(f"[cluster] Missing features (table fetch failed): {missing}")
+    print(f"[cluster] Clustering on {len(available)} features: {available}")
+
+    X_raw = df[available].copy()
 
     # Median imputation for suppressed/missing values
     imputer = SimpleImputer(strategy="median")
