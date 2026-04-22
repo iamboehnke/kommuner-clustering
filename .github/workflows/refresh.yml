@@ -1,0 +1,55 @@
+# .github/workflows/refresh.yml
+#
+# Refreshes the DST data and rebuilds the choropleth map quarterly.
+# The output (outputs/map.html) is committed back to the repo and served
+# via GitHub Pages at:
+#   https://mikkelbohnke.github.io/kommuner-clustering/outputs/map.html
+#
+# Also triggered manually via workflow_dispatch for on-demand rebuilds.
+#
+# Note: DST data is published annually for most indicators. A quarterly
+# refresh ensures the map always uses the latest available data without
+# hitting the API unnecessarily often.
+
+name: Refresh municipality clustering
+
+on:
+  schedule:
+    # First day of January, April, July, October at 07:00 UTC
+    - cron: "0 7 1 1,4,7,10 *"
+
+  workflow_dispatch:
+
+jobs:
+  rebuild:
+    name: Fetch, cluster, and publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run analysis pipeline
+        run: python main.py --no-cache
+
+      - name: Commit updated outputs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "data: quarterly map refresh ${{ github.run_id }}"
+          file_pattern: "outputs/map.html data/municipalities.parquet"
+          commit_user_name: "kommuner-clustering-bot"
+          commit_user_email: "bot@users.noreply.github.com"
