@@ -100,32 +100,6 @@ def build_choropleth(
     available_features = [c for c in FEATURE_COLS if c in df.columns]
     profiles = df.groupby("cluster")[available_features].mean()
 
-    bar_fig = go.Figure()
-    for i, row in profiles.iterrows():
-        colour = CLUSTER_COLOURS[i % len(CLUSTER_COLOURS)]
-        name   = cluster_names.get(i, f"Cluster {i+1}")
-        labels = [FEATURE_LABELS.get(c, c) for c in available_features]
-        vals   = row[available_features].tolist()
-        bar_fig.add_trace(go.Bar(
-            name=name,
-            x=labels,
-            y=vals,
-            marker_color=colour,
-            opacity=0.85,
-        ))
-
-    bar_fig.update_layout(
-        barmode="group",
-        title={"text": "Mean Feature Values per Cluster", "x": 0.5,
-               "font": {"size": 15}},
-        height=380,
-        margin={"t": 50, "b": 80, "l": 60, "r": 20},
-        legend={"orientation": "h", "y": -0.25},
-        yaxis_title="Value",
-        plot_bgcolor="white",
-        yaxis={"gridcolor": "#eee"},
-    )
-
     # --- Cluster summary cards data ---
     # For each cluster compute the most distinctive features (highest z-score)
     grand_mean = df[available_features].mean()
@@ -170,9 +144,8 @@ def build_choropleth(
 
     # --- Render ---
     map_html = map_fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="map")
-    bar_html = bar_fig.to_html(full_html=False, include_plotlyjs=False, div_id="bars")
 
-    html = _wrap_html(map_html, bar_html, cluster_summaries,
+    html = _wrap_html(map_html, cluster_summaries,
                       available_features, table_rows_json,
                       trajectory=trajectory,
                       cluster_names=cluster_names)
@@ -186,7 +159,7 @@ def build_choropleth(
 
 # ---------------------------------------------------------------------------
 
-def _wrap_html(map_html, bar_html, summaries, features, table_rows_json,
+def _wrap_html(map_html, summaries, features, table_rows_json,
                trajectory=None, cluster_names=None) -> str:
     feature_labels_js = json.dumps(
         {f: FEATURE_LABELS.get(f, f) for f in features}, ensure_ascii=False
@@ -295,11 +268,6 @@ def _wrap_html(map_html, bar_html, summaries, features, table_rows_json,
       Data: Statistics Denmark (dst.dk), CC 4.0 BY &bull;
       Boundaries: Dataforsyningen (DAWA) &bull; Analysis: K-means clustering, k=5
     </p>
-  </div>
-
-  <div class="card">
-    <h2>Cluster Profiles</h2>
-    {bar_html}
   </div>
 
   <div class="card">
