@@ -34,6 +34,7 @@ def build_choropleth(
     df: pd.DataFrame,
     geojson: dict,
     cluster_names: dict[int, str],
+    trajectory=None,
     output_path: str = "outputs/map.html",
 ) -> str:
     Path(output_path).parent.mkdir(exist_ok=True)
@@ -172,7 +173,9 @@ def build_choropleth(
     bar_html = bar_fig.to_html(full_html=False, include_plotlyjs=False, div_id="bars")
 
     html = _wrap_html(map_html, bar_html, cluster_summaries,
-                      available_features, table_rows_json)
+                      available_features, table_rows_json,
+                      trajectory=trajectory,
+                      cluster_names=cluster_names)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -183,7 +186,8 @@ def build_choropleth(
 
 # ---------------------------------------------------------------------------
 
-def _wrap_html(map_html, bar_html, summaries, features, table_rows_json) -> str:
+def _wrap_html(map_html, bar_html, summaries, features, table_rows_json,
+               trajectory=None, cluster_names=None) -> str:
     feature_labels_js = json.dumps(
         {f: FEATURE_LABELS.get(f, f) for f in features}, ensure_ascii=False
     )
@@ -202,6 +206,33 @@ def _wrap_html(map_html, bar_html, summaries, features, table_rows_json) -> str:
           <ul class="traits">{traits_li}</ul>
           <div class="examples">Eksempler: {examples_t}</div>
         </div>"""
+
+    # Build temporal sections if trajectory data is available
+    temporal_section = ""
+    if trajectory is not None and cluster_names is not None and len(trajectory) > 0:
+        sankey_html  = _build_sankey(trajectory, cluster_names)
+        movers_html  = _build_movers_table_html(trajectory)
+        n_changed    = trajectory["changed"].sum()
+        n_total      = len(trajectory)
+        temporal_section = f"""
+  <div class="card">
+    <h2>Cluster trajectories 2017 → 2023</h2>
+    <p style="font-size:13px;color:#57606a;margin-bottom:16px">
+      {n_changed} ud af {n_total} kommuner skiftede klynge i perioden 2017–2023.
+      Brede strømme = mange kommuner i den overgang. Diagonale strømme (samme farve)
+      = kommuner der forblev i samme klynge.
+    </p>
+    {sankey_html}
+  </div>
+
+  <div class="card">
+    <h2>Kommuner der skiftede klynge ({n_changed} stk.)</h2>
+    <p style="font-size:13px;color:#57606a;margin-bottom:12px">
+      Δ-kolonnerne viser ændringen i den socioøkonomiske indikator fra 2017 til 2023.
+      Grøn = forbedring relativt til klyngedefinitionen, rød = forværring.
+    </p>
+    {movers_html}
+  </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="da">
@@ -275,6 +306,8 @@ def _wrap_html(map_html, bar_html, summaries, features, table_rows_json) -> str:
     <h2>Cluster Summary</h2>
     <div class="cards-grid">{cards_html}</div>
   </div>
+
+  {temporal_section}
 
   <div class="card">
     <h2>All Municipalities</h2>
@@ -390,3 +423,163 @@ def _cluster_colour_js(summaries: dict) -> str:
         colour = s["colour"]
         lines.append(f"  colours['{name}'] = '{colour}';")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Temporal visualisation additions
+# ---------------------------------------------------------------------------
+
+def _build_sankey(traj: "pd.DataFrame", cluster_names: dict) -> str:
+    """
+    Builds a Plotly Sankey diagram showing how municipalities flowed between
+    clusters from 2017 to 2023.
+
+    Left nodes  = 2017 clusters
+    Right nodes = 2023 clusters
+    Flow width  = number of municipalities in that transition
+    """
+    import plotly.graph_objects as go
+
+    n = len(cluster_names)
+    # Node labels: past clusters on left, current on right
+    node_labels = (
+        [f"{cluster_names[i]}\n(2017)" for i in range(n)] +
+        [f"{cluster_names[i]}\n(2023)" for i in range(n)]
+    )
+    node_colours = (
+        [CLUSTER_COLOURS[i % len(CLUSTER_COLOURS)] for i in range(n)] +
+        [CLUSTER_COLOURS[i % len(CLUSTER_COLOURS)] for i in range(n)]
+    )
+
+    # Build flows
+    source_list, target_list, value_list, link_colours = [], [], [], []
+    for past_c in range(n):
+        for curr_c in range(n):
+            count = len(traj[
+                (traj["cluster_past"]    == past_c) &
+                (traj["cluster_current"] == curr_c)
+            ])
+            if count == 0:
+                continue
+            source_list.append(past_c)
+            target_list.append(curr_c + n)
+            value_list.append(count)
+            # Same cluster = solid colour, changed = light grey
+            if past_c == curr_c:
+                base = CLUSTER_COLOURS[curr_c % len(CLUSTER_COLOURS)].lstrip("#")
+                r, g, b = int(base[0:2],16), int(base[2:4],16), int(base[4:6],16)
+                link_colours.append(f"rgba({r},{g},{b},0.45)")
+            else:
+                link_colours.append("rgba(150,150,150,0.3)")
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=20,
+            thickness=22,
+            line=dict(color="white", width=0.5),
+            label=node_labels,
+            color=node_colours,
+        ),
+        link=dict(
+            source=source_list,
+            target=target_list,
+            value=value_list,
+            color=link_colours,
+        ),
+    ))
+    fig.update_layout(
+        title={"text": "Cluster trajectories 2017 → 2023",
+               "x": 0.5, "font": {"size": 15}},
+        height=400,
+        margin={"t": 50, "b": 20, "l": 20, "r": 20},
+        font_size=11,
+    )
+    return fig.to_html(full_html=False, include_plotlyjs=False, div_id="sankey")
+
+
+def _build_movers_table_html(traj: "pd.DataFrame") -> str:
+    """Builds an HTML table of municipalities that changed cluster."""
+    changed = traj[traj["changed"]].copy()
+    if len(changed) == 0:
+        return "<p style='color:#57606a;font-size:14px'>No municipalities changed cluster.</p>"
+
+    from src.cluster import FEATURE_COLS, FEATURE_LABELS
+    available_changes = [f"{c}_change" for c in FEATURE_COLS if f"{c}_change" in changed.columns]
+
+    rows_html = ""
+    for _, row in changed.iterrows():
+        direction = "▲" if _is_improvement(row) else "▼"
+        dir_class = "improved" if _is_improvement(row) else "declined"
+        change_cells = ""
+        for col in available_changes:
+            feat  = col.replace("_change", "")
+            label = FEATURE_LABELS.get(feat, feat)
+            val   = row[col]
+            sign  = "+" if val > 0 else ""
+            if "income" in feat:
+                formatted = f"{sign}{val:,.0f} kr."
+            else:
+                formatted = f"{sign}{val:.1f}%"
+            colour = "#1a7f37" if val > 0 else "#cf222e"
+            change_cells += f'<td style="color:{colour}">{formatted}</td>'
+
+        rows_html += f"""
+        <tr>
+          <td><strong>{row['municipality_name']}</strong></td>
+          <td>{row['cluster_name_past']}</td>
+          <td>{row['cluster_name_current']}</td>
+          <td class="{dir_class}">{direction}</td>
+          {change_cells}
+        </tr>"""
+
+    feat_headers = "".join(
+        f"<th>Δ {FEATURE_LABELS.get(col.replace('_change',''), col.replace('_change',''))}</th>"
+        for col in available_changes
+    )
+
+    return f"""
+    <input class="search-bar" id="movers-search" type="text"
+           placeholder="Search municipality..."
+           oninput="filterMovers()">
+    <div class="tbl-wrap">
+    <table id="movers-tbl">
+      <thead>
+        <tr>
+          <th>Kommune</th>
+          <th>Cluster 2017</th>
+          <th>Cluster 2023</th>
+          <th>Retning</th>
+          {feat_headers}
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    <style>
+      .improved {{ color: #1a7f37; font-weight:700; }}
+      .declined {{ color: #cf222e; font-weight:700; }}
+    </style>
+    <script>
+    function filterMovers() {{
+      const q = document.getElementById('movers-search').value.toLowerCase();
+      document.querySelectorAll('#movers-tbl tbody tr').forEach(tr => {{
+        tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+      }});
+    }}
+    </script>"""
+
+
+def _is_improvement(row: "pd.Series") -> bool:
+    """
+    Heuristic: a municipality 'improved' if income or education increased
+    OR unemployment decreased.
+    """
+    improved = 0
+    if "median_income_change" in row and row["median_income_change"] > 0:
+        improved += 1
+    if "pct_higher_edu_change" in row and row["pct_higher_edu_change"] > 0:
+        improved += 1
+    if "unemployment_rate_change" in row and row["unemployment_rate_change"] < 0:
+        improved += 1
+    return improved >= 2
