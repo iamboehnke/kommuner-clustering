@@ -277,9 +277,27 @@ def fetch_housing(year: str = "2023") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def fetch_geodata() -> dict:
-    r = requests.get(DAWA_URL, timeout=30)
+    """
+    Fetches official Danish municipality boundaries from DAWA and simplifies
+    the geometry to reduce file size.
+
+    DAWA provides 1:1000-scale precision (suitable for printed maps).
+    For a national-level web choropleth we only need ~1:100000 precision.
+    Simplifying to 0.005 degree tolerance (~500m) reduces the file from
+    ~150 MB to ~2 MB while looking identical at national zoom level.
+    """
+    import geopandas as gpd
+    import json as _json
+
+    r = requests.get(DAWA_URL, timeout=60)
     r.raise_for_status()
-    return r.json()
+
+    gdf = gpd.GeoDataFrame.from_features(r.json()["features"], crs="EPSG:4326")
+    gdf["geometry"] = gdf["geometry"].simplify(tolerance=0.005, preserve_topology=True)
+
+    simplified = _json.loads(gdf.to_json())
+    print(f"[fetch] GeoJSON: {len(simplified['features'])} features after simplification")
+    return simplified
 
 
 # ---------------------------------------------------------------------------
