@@ -1,18 +1,18 @@
 """
-Fetches socioeconomic data for all 98 Danish municipalities from the
-Statistics Denmark (DST) StatBank API, and GeoJSON boundaries from DAWA.
+Fetches socioeconomic data for all 98 Danish municipalities from DST.
 
-Variable codes confirmed from live API metadata (2026-04-22):
+KEY INSIGHT (confirmed from live API responses):
+The DST CSV API returns TEXT LABELS in area columns, not numeric codes.
+Requesting OMRÅDE=["101"] returns "København" in the CSV, not "101".
+Solution: reverse-lookup from name -> code using municipalities.py.
 
-  FOLK1A:   OMRÅDE, KØN (values: TOT/1/2), ALDER, CIVILSTAND, Tid  -> INDHOLD
-  INDKP101: OMRÅDE, INDKOMSTTYPE (required), ENHED (required),
-            KOEN (values: MOK/M/K), Tid                            -> INDHOLD
-  HFUDD11:  BOPOMR (municipality), HERKOMST, HFUDD, ALDER, KØN, Tid -> INDHOLD
-  BOL101:   OMRÅDE, BEBO (required), ANVENDELSE, UDLFORH, EJER,
-            OPFØRELSESÅR, Tid                                       -> INDHOLD
-
-Unemployment: AULAAR has no municipality dimension. Use AUP01 metadata
-to find the correct table. Clustering runs on 4 variables if all else fails.
+Confirmed variable names and time formats:
+  FOLK1A:   OMRÅDE (text), KØN, ALDER, CIVILSTAND, TID -> INDHOLD
+  AUP01:    OMRÅDE (text), ALDER, KØN, Tid (monthly: "2024M01") -> INDHOLD
+  INDKP101: OMRÅDE (text), INDKOMSTTYPE (text), ENHED (text), KOEN, Tid -> INDHOLD
+  HFUDD11:  BOPOMR (text), HFUDD, HERKOMST, ALDER, KØN, Tid -> INDHOLD
+  BOL101:   OMRÅDE (text), BEBO, EJER (text), Tid -> INDHOLD
+              social housing label = "Almene boligselskaber"
 """
 
 import json
@@ -33,7 +33,11 @@ HEADERS = {
     "User-Agent": "kommuner-clustering/1.0 (portfolio; github.com/iamboehnke)",
 }
 
-VALID_CODES = set(MUNICIPALITY_NAMES.keys())  # {"101", "147", ...}
+# Forward: code -> name  e.g. {"101": "København"}
+# Reverse: name -> code  e.g. {"København": "101"}
+CODE_TO_NAME = MUNICIPALITY_NAMES
+NAME_TO_CODE = {v: k for k, v in MUNICIPALITY_NAMES.items()}
+VALID_CODES  = set(MUNICIPALITY_NAMES.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -44,32 +48,11 @@ def _get_codes() -> list[str]:
     return list(MUNICIPALITY_NAMES.keys())
 
 
-def print_table_info(table: str) -> None:
-    """Prints live variable codes for a table to the Actions log."""
-    try:
-        r = requests.get(
-            f"{DST_INFO_API}/{table}",
-            params={"lang": "da", "format": "JSON"},
-            timeout=15,
-        )
-        if not r.ok:
-            print(f"  [meta] {table}: HTTP {r.status_code}")
-            return
-        info = r.json()
-        print(f"  [meta] {table}: {info.get('text', '')}")
-        for var in info.get("variables", []):
-            vals = [v["id"] for v in var.get("values", [])[:5]]
-            req  = "(REQUIRED)" if not var.get("elimination") else "(optional)"
-            print(f"    '{var['id']}' {req}: e.g. {vals}")
-    except Exception as e:
-        print(f"  [meta] {table}: {e}")
-
-
 def _dst_post(table: str, variables: list) -> pd.DataFrame:
-    """POST to DST CSV API. Logs payload for diagnostics."""
+    """POST to DST CSV API. Reads all columns as strings for reliable parsing."""
     payload = {"table": table, "format": "CSV", "lang": "da", "variables": variables}
     payload_str = json.dumps(payload, ensure_ascii=False)
-    print(f"  [dst] POST {table}: {payload_str[:400]}")
+    print(f"  [dst] POST {table}")
 
     try:
         r = requests.post(
@@ -84,8 +67,6 @@ def _dst_post(table: str, variables: list) -> pd.DataFrame:
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
 
-    # Read as all-string first, then convert INDHOLD manually.
-    # This avoids any ambiguity with Danish thousands/decimal separators.
     df = pd.read_csv(io.StringIO(r.text), sep=";", dtype=str, encoding="utf-8")
     print(f"  [dst] {table}: {len(df)} rows, cols: {list(df.columns)}")
     return df
@@ -94,27 +75,29 @@ def _dst_post(table: str, variables: list) -> pd.DataFrame:
 def _to_numeric(series: pd.Series) -> pd.Series:
     """
     Converts a DST INDHOLD column to float.
-    DST uses '.' as thousands separator and ',' as decimal separator.
-    Suppressed cells contain '..' which coerces to NaN then 0.
+    DST uses '.' as thousands sep and ',' as decimal sep in Danish locale.
+    Suppressed cells contain '..' -> NaN -> 0.
     """
     return (
         pd.to_numeric(
             series.astype(str)
                   .str.strip()
-                  .str.replace(".", "", regex=False)   # strip thousands sep
-                  .str.replace(",", ".", regex=False),  # decimal sep -> dot
+                  .str.replace(".", "", regex=False)
+                  .str.replace(",", ".", regex=False),
             errors="coerce"
         ).fillna(0)
     )
 
 
-def _kode(df: pd.DataFrame, col: str) -> pd.Series:
+def _resolve_kode(df: pd.DataFrame, col: str) -> pd.Series:
     """
-    Extracts the numeric municipality code from a DST area column.
-    Values may be bare codes ('101') or labelled ('101 København').
-    Returns a Series of stripped code strings.
+    Resolves municipality codes from a DST text-label area column.
+
+    DST returns text labels like 'København', 'Frederiksberg' in the CSV.
+    We reverse-lookup against our known municipality name->code mapping.
+    Unrecognised names get NaN (subsequently filtered out).
     """
-    return df[col].astype(str).str.strip().str.extract(r"(\d+)", expand=False)
+    return df[col].astype(str).str.strip().map(NAME_TO_CODE)
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +106,8 @@ def _kode(df: pd.DataFrame, col: str) -> pd.Series:
 
 def fetch_population(year: str = "2024K1") -> pd.DataFrame:
     """
-    FOLK1A -- population by municipality and single-year age.
-    Confirmed variables: OMRÅDE, KØN, ALDER, CIVILSTAND, Tid -> INDHOLD
+    FOLK1A: Population by municipality, age, sex, marital status.
+    OMRÅDE column returns text labels -> reverse-lookup to codes.
     """
     codes = _get_codes()
     df = _dst_post("FOLK1A", [
@@ -135,28 +118,18 @@ def fetch_population(year: str = "2024K1") -> pd.DataFrame:
         {"code": "TID",        "values": [year]},
     ])
 
-    df["kode"]    = _kode(df, "OMRÅDE")
+    df["kode"] = _resolve_kode(df, "OMRÅDE")
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
+
     df["age_num"] = pd.to_numeric(
         df["ALDER"].astype(str).str.extract(r"(\d+)", expand=False),
         errors="coerce"
     )
     df["n"] = _to_numeric(df["INDHOLD"])
-
-    # Debug: show a sample so any remaining issues are visible in the log
-    print(f"  DEBUG FOLK1A sample -- OMRÅDE: {df['OMRÅDE'].head(3).tolist()}")
-    print(f"  DEBUG FOLK1A kode: {df['kode'].head(3).tolist()}")
-    print(f"  DEBUG FOLK1A n: {df['n'].head(3).tolist()}")
-
     df = df.dropna(subset=["age_num"]).copy()
-    df = df[df["kode"].isin(VALID_CODES)].copy()
-    print(f"  After filtering: {len(df)} rows across {df['kode'].nunique()} municipalities")
 
-    if df.empty:
-        raise RuntimeError(
-            "FOLK1A: 0 rows after filtering. "
-            f"OMRÅDE sample: {df['OMRÅDE'].head(5).tolist()}, "
-            f"kode sample: {df['kode'].head(5).tolist()}"
-        )
+    print(f"  FOLK1A: {df['kode'].nunique()} municipalities, "
+          f"{df['age_num'].nunique()} age groups")
 
     totals  = df.groupby("kode")["n"].sum().rename("pop_total")
     elderly = df[df["age_num"] >= 65].groupby("kode")["n"].sum().rename("pop_elderly")
@@ -171,44 +144,36 @@ def fetch_population(year: str = "2024K1") -> pd.DataFrame:
     ]
 
 
-def fetch_unemployment() -> pd.DataFrame:
+def fetch_unemployment(year_month: str = "2024M01") -> pd.DataFrame:
     """
-    Municipality-level unemployment.
-    AULAAR has no municipality dimension -- we try AUP01 and read its metadata.
-    If that fails, we skip unemployment gracefully.
+    AUP01: Unemployment rate by municipality.
+    Time format is monthly: "2024M01". OMRÅDE returns text labels.
     """
     codes = _get_codes()
-    print_table_info("AUP01")
-
-    # Try with the first variable code listed in the AUP01 metadata
-    # The actual codes will be visible in the log above
     df = _dst_post("AUP01", [
         {"code": "OMRÅDE", "values": codes},
-        {"code": "TID",    "values": ["2023"]},
+        {"code": "ALDER",  "values": ["TOT"]},
+        {"code": "KØN",    "values": ["TOT"]},
+        {"code": "TID",    "values": [year_month]},
     ])
 
-    df["kode"] = _kode(df, "OMRÅDE")
-    df = df[df["kode"].isin(VALID_CODES)].copy()
-    val_col = "INDHOLD" if "INDHOLD" in df.columns else df.columns[-1]
-    df["n"] = _to_numeric(df[val_col])
+    df["kode"] = _resolve_kode(df, "OMRÅDE")
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
+    df["unemployment_rate"] = _to_numeric(df["INDHOLD"])
 
-    print(f"  AUP01 col sample: {list(df.columns)}")
-    print(f"  AUP01 first rows:\n{df.head(3).to_string()}")
-
-    # Take the mean across all non-OMRÅDE/TID columns per municipality
+    print(f"  AUP01: {df['kode'].nunique()} municipalities")
     return (
-        df.groupby("kode")["n"].mean()
+        df.groupby("kode")["unemployment_rate"].mean()
         .reset_index()
-        .rename(columns={"kode": "OMRÅDE", "n": "unemployment_rate"})
+        .rename(columns={"kode": "OMRÅDE"})
     )
 
 
 def fetch_income(year: str = "2022") -> pd.DataFrame:
     """
-    INDKP101 -- income by municipality.
-    Confirmed variables: OMRÅDE, INDKOMSTTYPE (req), ENHED (req), KOEN, Tid -> INDHOLD
-    ENHED values: 101=antal, 110=gns, 116=median kr.
-    KOEN values: MOK=total, M=mænd, K=kvinder
+    INDKP101: Income by municipality.
+    ENHED label 'Gennemsnit for alle personer (kr.)' = mean income for all persons.
+    INDKOMSTTYPE label '1 Disponibel indkomst...' = disposable income.
     """
     codes = _get_codes()
     df = _dst_post("INDKP101", [
@@ -219,22 +184,22 @@ def fetch_income(year: str = "2022") -> pd.DataFrame:
         {"code": "TID",          "values": [year]},
     ])
 
-    print(f"  INDKP101 ENHED sample: {df['ENHED'].unique()[:6].tolist()}")
-    print(f"  INDKP101 INDKOMSTTYPE sample: {df['INDKOMSTTYPE'].unique()[:6].tolist()}")
-
-    df["kode"] = _kode(df, "OMRÅDE")
-    df = df[df["kode"].isin(VALID_CODES)].copy()
+    df["kode"] = _resolve_kode(df, "OMRÅDE")
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
     df["n"] = _to_numeric(df["INDHOLD"])
 
-    # ENHED 116 = median income in kr.; fall back to 110 (mean) if not present
-    enhed_col = "ENHED"
-    median_mask = df[enhed_col].astype(str).str.contains("116", na=False)
-    if not median_mask.any():
-        median_mask = df[enhed_col].astype(str).str.contains("110", na=False)
-    if not median_mask.any():
-        median_mask = pd.Series([True] * len(df), index=df.index)
+    # Filter to: disposable income + mean income for all persons
+    indk_mask = df["INDKOMSTTYPE"].astype(str).str.startswith("1 ")
+    enhed_mask = df["ENHED"].astype(str).str.contains("Gennemsnit for alle", na=False)
 
-    df_m = df[median_mask].copy()
+    df_m = df[indk_mask & enhed_mask].copy()
+    if len(df_m) == 0:
+        # Fallback: any mean income row
+        df_m = df[enhed_mask].copy()
+    if len(df_m) == 0:
+        df_m = df.copy()
+
+    print(f"  INDKP101: {df_m['kode'].nunique()} municipalities")
     return (
         df_m.groupby("kode")["n"].mean()
         .reset_index()
@@ -244,27 +209,26 @@ def fetch_income(year: str = "2022") -> pd.DataFrame:
 
 def fetch_education(year: str = "2023") -> pd.DataFrame:
     """
-    HFUDD11 -- education by municipality of residence.
-    Confirmed municipality variable: BOPOMR (not KOMKODE, not BOPKOMMUNEKODE)
-    HFUDD codes H6x/H7x = higher education (medium/long cycle)
+    HFUDD11: Education by municipality of residence.
+    Municipality variable is BOPOMR (returns text labels -> reverse-lookup).
+    Higher education = HFUDD codes starting with H6 or H7.
     """
     codes = _get_codes()
     df = _dst_post("HFUDD11", [
-        {"code": "BOPOMR",    "values": codes},
-        {"code": "HFUDD",     "values": ["*"]},
-        {"code": "HERKOMST",  "values": ["TOT"]},
-        {"code": "ALDER",     "values": ["*"]},
-        {"code": "KØN",       "values": ["TOT"]},
-        {"code": "TID",       "values": [year]},
+        {"code": "BOPOMR",   "values": codes},
+        {"code": "HFUDD",    "values": ["*"]},
+        {"code": "HERKOMST", "values": ["TOT"]},
+        {"code": "ALDER",    "values": ["*"]},
+        {"code": "KØN",      "values": ["TOT"]},
+        {"code": "TID",      "values": [year]},
     ])
 
-    # HFUDD11 uses BOPOMR for municipality
-    omr_col = "BOPOMR" if "BOPOMR" in df.columns else df.columns[0]
-    df["kode"] = _kode(df, omr_col)
-    df = df[df["kode"].isin(VALID_CODES)].copy()
+    df["kode"] = _resolve_kode(df, "BOPOMR")
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
     df["n"] = _to_numeric(df["INDHOLD"])
 
-    hfudd_col = "HFUDD" if "HFUDD" in df.columns else df.columns[1]
+    # HFUDD codes H6x = medium cycle higher education, H7x = long cycle
+    hfudd_col = "HFUDD"
     higher_mask = df[hfudd_col].astype(str).str.match(r"H[67]")
 
     totals = df.groupby("kode")["n"].sum().rename("edu_total")
@@ -273,36 +237,29 @@ def fetch_education(year: str = "2023") -> pd.DataFrame:
     result = pd.concat([totals, higher], axis=1).fillna(0).reset_index()
     result = result[result["edu_total"] > 0].copy()
     result["pct_higher_edu"] = 100 * result["edu_higher"] / result["edu_total"]
+
+    print(f"  HFUDD11: {len(result)} municipalities")
     return result[["kode", "pct_higher_edu"]].rename(columns={"kode": "OMRÅDE"})
 
 
 def fetch_housing(year: str = "2023") -> pd.DataFrame:
     """
-    BOL101 -- dwellings by ownership and municipality.
-    Confirmed variables: OMRÅDE, BEBO (req), ANVENDELSE, UDLFORH, EJER, OPFØRELSESÅR, Tid
-    EJER values: 10/20/30/41/SK/UOP2 -- '30' is typically almene boliger
+    BOL101: Dwellings by ownership and municipality.
+    Social housing label confirmed: 'Almene boligselskaber'.
     """
     codes = _get_codes()
     df = _dst_post("BOL101", [
-        {"code": "OMRÅDE",      "values": codes},
-        {"code": "BEBO",        "values": ["*"]},
-        {"code": "EJER",        "values": ["*"]},
-        {"code": "TID",         "values": [year]},
+        {"code": "OMRÅDE", "values": codes},
+        {"code": "BEBO",   "values": ["*"]},
+        {"code": "EJER",   "values": ["*"]},
+        {"code": "TID",    "values": [year]},
     ])
 
-    print(f"  BOL101 EJER sample: {df['EJER'].unique()[:8].tolist()}")
-
-    df["kode"] = _kode(df, "OMRÅDE")
-    df = df[df["kode"].isin(VALID_CODES)].copy()
+    df["kode"] = _resolve_kode(df, "OMRÅDE")
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
     df["n"] = _to_numeric(df["INDHOLD"])
 
-    ejer_col = "EJER" if "EJER" in df.columns else df.columns[1]
-    # Social/almene boliger: EJER='30' or any label containing 'alm'
-    social_mask = (
-        df[ejer_col].astype(str).str.strip().eq("30") |
-        df[ejer_col].astype(str).str.lower().str.contains("almen|alm\\.", na=False)
-    )
-    print(f"  BOL101 social rows: {social_mask.sum()} of {len(df)}")
+    social_mask = df["EJER"].astype(str).str.strip() == "Almene boligselskaber"
 
     totals = df.groupby("kode")["n"].sum().rename("dwellings_total")
     social = df[social_mask].groupby("kode")["n"].sum().rename("dwellings_social")
@@ -310,6 +267,8 @@ def fetch_housing(year: str = "2023") -> pd.DataFrame:
     result = pd.concat([totals, social], axis=1).fillna(0).reset_index()
     result = result[result["dwellings_total"] > 0].copy()
     result["pct_social_housing"] = 100 * result["dwellings_social"] / result["dwellings_total"]
+
+    print(f"  BOL101: {len(result)} municipalities")
     return result[["kode", "pct_social_housing"]].rename(columns={"kode": "OMRÅDE"})
 
 
@@ -318,7 +277,6 @@ def fetch_housing(year: str = "2023") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def fetch_geodata() -> dict:
-    """Fetches official Danish municipality boundaries from DAWA."""
     r = requests.get(DAWA_URL, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -329,11 +287,6 @@ def fetch_geodata() -> dict:
 # ---------------------------------------------------------------------------
 
 def build_dataset(cache: bool = True) -> pd.DataFrame:
-    """
-    Fetches all tables, joins by OMRÅDE, returns one row per municipality.
-    Partial data (some tables failing) is handled gracefully -- clustering
-    runs on whichever variables successfully loaded.
-    """
     cache_path = DATA_DIR / "municipalities.parquet"
     DATA_DIR.mkdir(exist_ok=True)
 
@@ -357,7 +310,7 @@ def build_dataset(cache: bool = True) -> pd.DataFrame:
         print(f"\n[fetch] {name}...")
         try:
             df = fn()
-            print(f"  -> {len(df)} municipalities")
+            print(f"  -> {len(df)} rows")
             base = df if base is None else base.merge(df, on="OMRÅDE", how="outer")
         except Exception as e:
             print(f"  WARNING: {name} failed: {e}")
@@ -365,8 +318,8 @@ def build_dataset(cache: bool = True) -> pd.DataFrame:
 
     if base is None or len(base) == 0:
         raise RuntimeError(
-            f"No data loaded at all. Failed: {failed}. "
-            "Check [meta] and DEBUG lines above."
+            f"No data loaded. Failed: {failed}. "
+            "Check the log above for details."
         )
     if failed:
         print(f"\n[fetch] Partial data. Failed: {failed}. Clustering on available variables.")
