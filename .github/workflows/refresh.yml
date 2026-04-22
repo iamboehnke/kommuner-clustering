@@ -52,6 +52,6 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "data: quarterly map refresh ${{ github.run_id }}"
-          file_pattern: "outputs/map.html data/municipalities.parquet"
+          file_pattern: "outputs/map.html data/municipalities_2023.parquet data/municipalities_2017.parquet"
           commit_user_name: "kommuner-clustering-bot"
           commit_user_email: "bot@users.noreply.github.com"
