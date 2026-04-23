@@ -224,22 +224,25 @@ def _wrap_html(map_html, summaries, features, table_rows_json,
              padding: 20px; margin-bottom: 20px; }}
 
     /* Cluster summary cards */
-    .cards-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(190px,1fr));
+    .cards-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr));
                    gap: 14px; }}
     .cluster-card {{ background: white; border: 1px solid #d0d7de; border-radius: 6px;
-                     padding: 14px; }}
-    .cluster-card-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }}
+                     padding: 14px; min-width: 0; overflow: hidden; }}
+    .cluster-card-header {{ display: flex; align-items: center; gap: 8px;
+                             margin-bottom: 10px; flex-wrap: wrap; }}
     .cluster-dot {{ width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }}
-    .cluster-n {{ margin-left: auto; font-size: 12px; color: #57606a; }}
-    .traits {{ padding-left: 16px; font-size: 13px; color: #444; line-height: 1.6; }}
+    .cluster-n {{ margin-left: auto; font-size: 12px; color: #57606a; white-space: nowrap; }}
+    .traits {{ padding-left: 16px; font-size: 13px; color: #444; line-height: 1.6;
+               word-break: break-word; overflow-wrap: break-word; }}
     .traits li {{ margin-bottom: 3px; }}
-    .examples {{ margin-top: 10px; font-size: 11px; color: #57606a; font-style: italic; }}
+    .examples {{ margin-top: 10px; font-size: 11px; color: #57606a; font-style: italic;
+                 word-break: break-word; }}
 
     /* Municipality table */
     .search-bar {{ width: 100%; padding: 8px 12px; border: 1px solid #d0d7de;
                    border-radius: 6px; font-size: 14px; margin-bottom: 12px; outline: none; }}
     .search-bar:focus {{ border-color: #0969da; }}
-    .tbl-wrap {{ overflow-x: auto; }}
+    .tbl-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th {{ background: #f6f8fa; padding: 8px 12px; text-align: left;
           border-bottom: 2px solid #d0d7de; white-space: nowrap;
@@ -253,7 +256,12 @@ def _wrap_html(map_html, summaries, features, table_rows_json,
     .no-results {{ text-align: center; padding: 24px; color: #57606a; font-size: 14px; }}
 
     /* Responsive */
-    @media (max-width: 600px) {{
+    @media (max-width: 480px) {{
+      .cards-grid {{ grid-template-columns: 1fr; }}
+      .container {{ padding: 12px 12px; }}
+      .card {{ padding: 14px; }}
+    }}
+    @media (min-width: 481px) and (max-width: 700px) {{
       .cards-grid {{ grid-template-columns: 1fr 1fr; }}
     }}
   </style>
