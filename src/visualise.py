@@ -131,9 +131,11 @@ def build_choropleth(
         }
 
     # --- Municipality table data ---
-    table_cols = ["municipality_name", "cluster_name"] + available_features
-    table_df   = df[table_cols].copy()
-    table_df   = table_df.sort_values("municipality_name")
+    outcome_cols = [c for c in ["pct_disability_pension", "pct_youth_education"]
+                    if c in df.columns]
+    table_cols   = ["municipality_name", "municipality_code", "cluster_name"] + available_features + outcome_cols
+    table_df     = df[[c for c in table_cols if c in df.columns]].copy()
+    table_df     = table_df.sort_values("municipality_name")
     # Round for display
     for col in available_features:
         if "income" in col:
@@ -164,6 +166,12 @@ def _wrap_html(map_html, summaries, features, table_rows_json,
     feature_labels_js = json.dumps(
         {f: FEATURE_LABELS.get(f, f) for f in features}, ensure_ascii=False
     )
+
+    # Outcome variable labels
+    OUTCOME_LABELS = {
+        "pct_disability_pension": "Førtidspension %",
+        "pct_youth_education":    "Ungdomsuddannelse %",
+    }
 
     cards_html = ""
     for i, s in summaries.items():
@@ -285,6 +293,50 @@ def _wrap_html(map_html, summaries, features, table_rows_json,
 
   {temporal_section}
 
+  <div class="card" id="peer-card">
+    <h2>Peer Benchmarking</h2>
+    <p style="font-size:13px;color:#57606a;margin-bottom:14px">
+      Find the municipalities that are structurally most similar to a given municipality.
+      These are the correct peers for benchmarking -- not simply geographic neighbours.
+    </p>
+    <input class="search-bar" id="peer-search" type="text"
+           placeholder="Type a municipality name, e.g. Odense..."
+           oninput="searchPeers()" autocomplete="off">
+    <div id="peer-suggestions" style="display:none;background:white;border:1px solid #d0d7de;
+         border-radius:6px;margin-top:-10px;margin-bottom:12px;max-height:180px;overflow-y:auto;
+         font-size:13px;"></div>
+    <div id="peer-results" style="display:none">
+      <div id="peer-header" style="margin-bottom:14px;"></div>
+      <div class="tbl-wrap">
+        <table id="peer-table">
+          <thead id="peer-thead"></thead>
+          <tbody id="peer-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="outcome-card">
+    <h2>Outcome comparison within clusters</h2>
+    <p style="font-size:13px;color:#57606a;margin-bottom:16px">
+      Municipalities in the same structural cluster should face similar challenges.
+      Where outcomes differ within a cluster, that gap is worth explaining.
+      Select an outcome to see the distribution within each cluster.
+    </p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+      <button class="outcome-btn active" onclick="selectOutcome('pct_disability_pension', this)">
+        Førtidspension %
+      </button>
+      <button class="outcome-btn" onclick="selectOutcome('pct_youth_education', this)">
+        Ungdomsuddannelse %
+      </button>
+    </div>
+    <div id="outcome-plot"></div>
+    <p style="font-size:11px;color:#aaa;margin-top:12px">
+      Kilde: Danmarks Statistik. Hvert punkt er en kommune. Rød linje = median for klyngen.
+    </p>
+  </div>
+
   <div class="card">
     <h2>All Municipalities</h2>
     <input class="search-bar" id="search" type="text"
@@ -302,25 +354,237 @@ def _wrap_html(map_html, summaries, features, table_rows_json,
 <script>
 const ROWS = {table_rows_json};
 const FEAT_LABELS = {feature_labels_js};
-
+const OUTCOME_LABELS = {{
+  pct_disability_pension: "Førtidspension %",
+  pct_youth_education:    "Ungdomsuddannelse %",
+}};
 const CLUSTER_COLOURS = {json.dumps(list(CLUSTER_COLOURS))};
-
-const COL_ORDER = ["municipality_name", "cluster_name",
-  ...Object.keys(FEAT_LABELS)];
+const COL_ORDER = ["municipality_name", "cluster_name", ...Object.keys(FEAT_LABELS)];
 const COL_LABELS = {{
   municipality_name: "Kommune",
-  cluster_name: "Cluster",
+  cluster_name:      "Cluster",
   ...FEAT_LABELS,
+  ...OUTCOME_LABELS,
 }};
 
 let sortCol = "municipality_name";
-let sortAsc = true;
+let sortAsc  = true;
+let activeOutcome = "pct_disability_pension";
 
 function clusterColor(name) {{
-  const colours = {{}}; 
+  const colours = {{}};
   {_cluster_colour_js(summaries)}
   return colours[name] || "#999";
 }}
+
+// ---------------------------------------------------------------------------
+// Peer benchmarking
+// ---------------------------------------------------------------------------
+
+function searchPeers() {{
+  const q = document.getElementById("peer-search").value.trim().toLowerCase();
+  const sug = document.getElementById("peer-suggestions");
+  if (q.length < 2) {{ sug.style.display = "none"; return; }}
+
+  const matches = ROWS.filter(r => r.municipality_name.toLowerCase().includes(q));
+  if (!matches.length) {{ sug.style.display = "none"; return; }}
+
+  sug.innerHTML = matches.slice(0, 8).map(r =>
+    `<div class="sug-item" onclick="showPeers('${{r.municipality_name}}')"
+          style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #eee"
+          onmouseover="this.style.background='#f6f8fa'"
+          onmouseout="this.style.background=''">
+       ${{r.municipality_name}}
+       <span style="color:#57606a;font-size:11px;margin-left:6px">${{r.cluster_name}}</span>
+     </div>`
+  ).join("");
+  sug.style.display = "block";
+}}
+
+function showPeers(name) {{
+  document.getElementById("peer-suggestions").style.display = "none";
+  document.getElementById("peer-search").value = name;
+
+  const selected = ROWS.find(r => r.municipality_name === name);
+  if (!selected) return;
+
+  // Peers = same cluster, sorted by feature similarity (Euclidean distance)
+  const featKeys = Object.keys(FEAT_LABELS);
+  const peers = ROWS
+    .filter(r => r.cluster_name === selected.cluster_name && r.municipality_name !== name)
+    .map(r => {{
+      const dist = featKeys.reduce((sum, k) => {{
+        const a = selected[k] || 0, b = r[k] || 0;
+        return sum + (a - b) ** 2;
+      }}, 0);
+      return {{ ...r, _dist: Math.sqrt(dist) }};
+    }})
+    .sort((a, b) => a._dist - b._dist)
+    .slice(0, 6);
+
+  // Header
+  const colour = clusterColor(selected.cluster_name);
+  document.getElementById("peer-header").innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span style="background:${{colour}};color:white;padding:3px 12px;
+                   border-radius:12px;font-size:13px;font-weight:600">
+        ${{selected.cluster_name}}
+      </span>
+      <strong style="font-size:16px">${{name}}</strong>
+      <span style="font-size:13px;color:#57606a">
+        — ${{peers.length}} strukturelle peers
+      </span>
+    </div>`;
+
+  // Table
+  const allRows = [selected, ...peers];
+  const thead = document.getElementById("peer-thead");
+  const tbody = document.getElementById("peer-tbody");
+  thead.innerHTML = "";
+  tbody.innerHTML = "";
+
+  const displayCols = ["municipality_name", ...featKeys,
+    ...Object.keys(OUTCOME_LABELS).filter(k => selected[k] != null)];
+
+  const htr = document.createElement("tr");
+  displayCols.forEach(col => {{
+    const th = document.createElement("th");
+    th.textContent = COL_LABELS[col] || col;
+    htr.appendChild(th);
+  }});
+  thead.appendChild(htr);
+
+  allRows.forEach((r, idx) => {{
+    const tr = document.createElement("tr");
+    if (idx === 0) tr.style.fontWeight = "600";
+    displayCols.forEach(col => {{
+      const td = document.createElement("td");
+      if (col === "municipality_name") {{
+        td.textContent = r[col];
+        if (idx === 0) td.style.color = colour;
+      }} else if (col === "median_income") {{
+        td.textContent = r[col] != null ? Number(r[col]).toLocaleString("da-DK") + " kr." : "—";
+      }} else {{
+        td.textContent = r[col] != null ? r[col] + "%" : "—";
+      }}
+      tr.appendChild(td);
+    }});
+    tbody.appendChild(tr);
+  }});
+
+  document.getElementById("peer-results").style.display = "block";
+
+  // Highlight on map via Plotly
+  try {{
+    const mapDiv = document.getElementById("choropleth").querySelector(".js-plotly-plot")
+                   || document.querySelector(".js-plotly-plot");
+    if (mapDiv) {{
+      const code = (selected.municipality_code || "").toString().padStart(4, "0");
+      // Flash the selected municipality by briefly updating opacity
+      Plotly.restyle(mapDiv, {{ "marker.opacity": 0.3 }});
+      setTimeout(() => Plotly.restyle(mapDiv, {{ "marker.opacity": 0.85 }}), 400);
+    }}
+  }} catch(e) {{}}
+}}
+
+// ---------------------------------------------------------------------------
+// Outcome comparison plot (built with pure SVG/HTML -- no extra JS lib needed)
+// ---------------------------------------------------------------------------
+
+function selectOutcome(key, btn) {{
+  document.querySelectorAll(".outcome-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  activeOutcome = key;
+  renderOutcomePlot(key);
+}}
+
+function renderOutcomePlot(key) {{
+  const container = document.getElementById("outcome-plot");
+  container.innerHTML = "";
+
+  // Group rows by cluster
+  const clusterNames = [...new Set(ROWS.map(r => r.cluster_name))].sort();
+  const hasData = ROWS.some(r => r[key] != null && !isNaN(r[key]));
+
+  if (!hasData) {{
+    container.innerHTML = `<p style="color:#57606a;font-size:13px;padding:20px 0">
+      No data available for this outcome yet. It will appear after the next quarterly refresh.</p>`;
+    return;
+  }}
+
+  // Build a simple dot-plot (strip chart) per cluster using SVG
+  const groups = clusterNames.map(name => {{
+    const vals = ROWS
+      .filter(r => r.cluster_name === name && r[key] != null && !isNaN(r[key]))
+      .map(r => ({{ name: r.municipality_name, val: parseFloat(r[key]) }}))
+      .sort((a, b) => a.val - b.val);
+    const median = vals.length ? vals[Math.floor(vals.length / 2)].val : 0;
+    return {{ name, vals, median, colour: clusterColor(name) }};
+  }}).filter(g => g.vals.length > 0);
+
+  if (!groups.length) return;
+
+  const allVals = groups.flatMap(g => g.vals.map(v => v.val));
+  const minV = Math.min(...allVals);
+  const maxV = Math.max(...allVals);
+  const range = maxV - minV || 1;
+
+  const colW  = 180;
+  const padT  = 30;
+  const padB  = 50;
+  const height = 280;
+  const dotR  = 5;
+  const plotH = height - padT - padB;
+  const totalW = groups.length * colW;
+
+  const yScale = v => padT + plotH - ((v - minV) / range) * plotH;
+
+  let svgContent = `<svg viewBox="0 0 ${{totalW}} ${{height}}" xmlns="http://www.w3.org/2000/svg"
+    style="width:100%;max-width:${{totalW}}px;display:block;overflow:visible">`;
+
+  // Y-axis grid lines
+  const ticks = 5;
+  for (let i = 0; i <= ticks; i++) {{
+    const v = minV + (range * i / ticks);
+    const y = yScale(v);
+    svgContent += `<line x1="0" y1="${{y}}" x2="${{totalW}}" y2="${{y}}"
+      stroke="#eee" stroke-width="1"/>`;
+    svgContent += `<text x="4" y="${{y - 3}}" font-size="10" fill="#999">${{v.toFixed(1)}}%</text>`;
+  }}
+
+  groups.forEach((g, gi) => {{
+    const cx = gi * colW + colW / 2;
+
+    // Median line
+    const my = yScale(g.median);
+    svgContent += `<line x1="${{cx - 30}}" y1="${{my}}" x2="${{cx + 30}}" y2="${{my}}"
+      stroke="#cf222e" stroke-width="2.5" stroke-linecap="round"/>`;
+
+    // Dots
+    g.vals.forEach((item, vi) => {{
+      const cy = yScale(item.val);
+      // Jitter x slightly
+      const jitter = (vi % 5 - 2) * 4;
+      svgContent += `<circle cx="${{cx + jitter}}" cy="${{cy}}" r="${{dotR}}"
+        fill="${{g.colour}}" fill-opacity="0.65" stroke="white" stroke-width="1">
+        <title>${{item.name}}: ${{item.val.toFixed(1)}}%</title>
+      </circle>`;
+    }});
+
+    // Cluster label
+    svgContent += `<text x="${{cx}}" y="${{height - 10}}" text-anchor="middle"
+      font-size="11" fill="#57606a" font-weight="600">${{g.name}}</text>`;
+    svgContent += `<text x="${{cx}}" y="${{height - 26}}" text-anchor="middle"
+      font-size="10" fill="#999">median ${{g.median.toFixed(1)}}%</text>`;
+  }});
+
+  svgContent += "</svg>";
+  container.innerHTML = svgContent;
+}}
+
+// ---------------------------------------------------------------------------
+// Municipality table
+// ---------------------------------------------------------------------------
 
 function buildHeader() {{
   const tr = document.createElement("tr");
@@ -357,8 +621,8 @@ function renderTable(rows) {{
   }});
   const tbody = document.getElementById("tbody");
   tbody.innerHTML = "";
-  if (sorted.length === 0) {{
-    tbody.innerHTML = '<tr><td colspan="99" class="no-results">No municipalities match your search.</td></tr>';
+  if (!sorted.length) {{
+    tbody.innerHTML = '<tr><td colspan="99" class="no-results">No municipalities match.</td></tr>';
     return;
   }}
   sorted.forEach(r => {{
@@ -371,7 +635,7 @@ function renderTable(rows) {{
         td.innerHTML = `<span class="cluster-pill" style="background:${{colour}}">${{r.cluster_name}}</span>`;
       }} else if (col === "median_income") {{
         td.textContent = r[col] != null ? Number(r[col]).toLocaleString("da-DK") + " kr." : "—";
-      }} else if (col in FEAT_LABELS) {{
+      }} else if (col in FEAT_LABELS || col in OUTCOME_LABELS) {{
         td.textContent = r[col] != null ? r[col] + "%" : "—";
       }} else {{
         td.textContent = r[col] != null ? r[col] : "—";
@@ -384,8 +648,27 @@ function renderTable(rows) {{
 
 function filterTable() {{ renderTable(currentRows()); }}
 
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+// Add outcome button styles
+const style = document.createElement("style");
+style.textContent = `
+  .outcome-btn {{
+    padding: 7px 16px; border: 1px solid #d0d7de; border-radius: 20px;
+    background: white; cursor: pointer; font-size: 13px; color: #57606a;
+  }}
+  .outcome-btn:hover {{ background: #f6f8fa; }}
+  .outcome-btn.active {{
+    background: #0969da; color: white; border-color: #0969da;
+  }}
+`;
+document.head.appendChild(style);
+
 buildHeader();
 renderTable(ROWS);
+renderOutcomePlot(activeOutcome);
 </script>
 </body>
 </html>"""

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.fetch     import build_dataset, build_dataset_for_year, fetch_geodata
+from src.fetch     import build_dataset, build_dataset_for_year, fetch_geodata, fetch_outcomes
 from src.cluster   import (
     prepare_features, elbow_and_silhouette,
     run_kmeans, run_hierarchical,
@@ -112,16 +112,30 @@ def main():
             traj = None
 
     # -----------------------------------------------------------------
-    # Step 4: GeoJSON
+    # Step 4: Outcome variables (separate from clustering inputs)
     # -----------------------------------------------------------------
-    print("\n=== Step 4: GeoJSON ===")
+    print("\n=== Step 4: Outcome variables ===")
+    try:
+        df_outcomes = fetch_outcomes(year="2023", cache=cache)
+        if len(df_outcomes) > 1:
+            df_current = df_current.merge(df_outcomes, on="OMRÅDE", how="left")
+            print(f"  Outcome columns added: {[c for c in df_outcomes.columns if c != 'OMRÅDE']}")
+        else:
+            print("  No outcome data available -- continuing without.")
+    except Exception as e:
+        print(f"  WARNING: Outcome fetch failed: {e}")
+
+    # -----------------------------------------------------------------
+    # Step 5: GeoJSON
+    # -----------------------------------------------------------------
+    print("\n=== Step 5: GeoJSON ===")
     geojson = fetch_geodata()
     print(f"  {len(geojson['features'])} features")
 
     # -----------------------------------------------------------------
-    # Step 5: Visualisation
+    # Step 6: Visualisation
     # -----------------------------------------------------------------
-    print("\n=== Step 5: Visualisation ===")
+    print("\n=== Step 6: Visualisation ===")
     output = build_choropleth(
         df_current, geojson, cluster_names,
         trajectory=traj,

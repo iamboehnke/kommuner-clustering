@@ -304,7 +304,149 @@ def fetch_geodata() -> dict:
 # Master assembler
 # ---------------------------------------------------------------------------
 
-def build_dataset(cache: bool = True) -> pd.DataFrame:
+
+
+# ---------------------------------------------------------------------------
+# Outcome variable fetchers
+# These are NOT used as clustering inputs -- they stay separate so the
+# cluster structure remains purely structural. They are used to compare
+# performance within clusters (peer benchmarking).
+# ---------------------------------------------------------------------------
+
+def fetch_disability_pension(year: str = "2023") -> pd.DataFrame:
+    """
+    FORTS1: Recipients of disability pension (førtidspension) by municipality.
+
+    Returns share of working-age population (18-64) receiving disability pension.
+    This is one of the largest municipal social expenditure drivers and varies
+    significantly within structural peer groups -- making it a strong signal of
+    how well a municipality manages social inclusion.
+
+    Confirmed variable: BOPKOMMUNEDK (municipality of residence), not OMRÅDE.
+    """
+    codes = _get_codes()
+    print_table_info("FORTS1")
+
+    df = _dst_post("FORTS1", [
+        {"code": "BOPKOMMUNEDK", "values": codes},
+        {"code": "YDELSE",       "values": ["*"]},
+        {"code": "KØN",          "values": ["TOT"]},
+        {"code": "TID",          "values": [year]},
+    ])
+
+    # BOPKOMMUNEDK returns text labels like FOLK1A -- reverse lookup
+    omr_col = "BOPKOMMUNEDK" if "BOPKOMMUNEDK" in df.columns else df.columns[0]
+    df["kode"] = _resolve_kode(df, omr_col)
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
+    df["n"] = _to_numeric(df["INDHOLD"])
+
+    print(f"  FORTS1 YDELSE sample: {df['YDELSE'].unique()[:5].tolist()}")
+
+    # Total recipients across all disability pension types
+    totals = df.groupby("kode")["n"].sum().rename("disability_pension_count")
+
+    # We need working-age population to compute the share
+    # Fetch from FOLK1A for the same year
+    try:
+        pop_df = fetch_population(year=f"{year}K1")
+        pop_df = pop_df.rename(columns={"OMRÅDE": "kode"})
+        result = totals.reset_index().merge(pop_df[["kode", "pop_total"]], on="kode", how="left")
+        result["pct_disability_pension"] = (
+            100 * result["disability_pension_count"] / result["pop_total"]
+        ).round(2)
+        print(f"  FORTS1: {len(result)} municipalities")
+        return result[["kode", "pct_disability_pension"]].rename(columns={"kode": "OMRÅDE"})
+    except Exception as e:
+        print(f"  FORTS1: population join failed ({e}), returning raw counts")
+        result = totals.reset_index()
+        result["pct_disability_pension"] = result["disability_pension_count"]
+        return result[["kode", "pct_disability_pension"]].rename(columns={"kode": "OMRÅDE"})
+
+
+def fetch_youth_education(year: str = "2022") -> pd.DataFrame:
+    """
+    UNGEUDDU: Share of young people (15-24) enrolled in or having completed
+    a youth education programme (ungdomsuddannelse).
+
+    This is directly tied to the national 95% target (95-procent-målsætningen):
+    the goal that 95% of young people complete a youth education. Progress
+    varies considerably by municipality and is a key policy priority.
+
+    Note: education completion data typically lags 1-2 years.
+    """
+    codes = _get_codes()
+    print_table_info("UNGEUDDU")
+
+    df = _dst_post("UNGEUDDU", [
+        {"code": "BOPKOMMUNEDK", "values": codes},
+        {"code": "UDDANNELSE",   "values": ["*"]},
+        {"code": "TID",          "values": [year]},
+    ])
+
+    omr_col = "BOPKOMMUNEDK" if "BOPKOMMUNEDK" in df.columns else df.columns[0]
+    df["kode"] = _resolve_kode(df, omr_col)
+    df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
+    df["n"] = _to_numeric(df["INDHOLD"])
+
+    print(f"  UNGEUDDU UDDANNELSE sample: {df['UDDANNELSE'].unique()[:5].tolist()}")
+    print(f"  UNGEUDDU cols: {list(df.columns)}")
+
+    # Look for a percentage or "i gang/fuldfort" type row
+    udd_col = "UDDANNELSE" if "UDDANNELSE" in df.columns else df.columns[1]
+    pct_mask = df[udd_col].astype(str).str.lower().str.contains(
+        "pct|procent|andel|igang|fuldført|i alt", na=False
+    )
+    df_pct = df[pct_mask] if pct_mask.any() else df
+
+    result = (
+        df_pct.groupby("kode")["n"].mean()
+        .reset_index()
+        .rename(columns={"kode": "OMRÅDE", "n": "pct_youth_education"})
+    )
+    result["pct_youth_education"] = result["pct_youth_education"].round(1)
+    print(f"  UNGEUDDU: {len(result)} municipalities")
+    return result
+
+
+def fetch_outcomes(year: str = "2023", cache: bool = True) -> pd.DataFrame:
+    """
+    Fetches all outcome variables and returns a single merged DataFrame.
+    Cached separately from the structural variables.
+    """
+    cache_path = DATA_DIR / f"outcomes_{year}.parquet"
+    DATA_DIR.mkdir(exist_ok=True)
+
+    if cache and cache_path.exists():
+        print(f"[fetch] Outcomes {year}: loading from cache...")
+        return pd.read_parquet(cache_path)
+
+    print(f"\n[fetch] Fetching outcome variables for {year}...")
+
+    outcome_steps = [
+        ("Disability pension", lambda: fetch_disability_pension(year=year)),
+        ("Youth education",    lambda: fetch_youth_education(year=year)),
+    ]
+
+    base = None
+    for name, fn in outcome_steps:
+        print(f"\n  [outcomes] {name}...")
+        try:
+            df = fn()
+            print(f"    -> {len(df)} rows")
+            base = df if base is None else base.merge(df, on="OMRÅDE", how="outer")
+        except Exception as e:
+            print(f"    WARNING: {name} failed: {e}")
+
+    if base is None:
+        print("[fetch] All outcome fetches failed -- outcomes will be unavailable.")
+        return pd.DataFrame(columns=["OMRÅDE"])
+
+    base.to_parquet(cache_path, index=False)
+    print(f"\n[fetch] Outcomes saved: {len(base)} municipalities")
+    return base
+
+
+
     cache_path = DATA_DIR / "municipalities.parquet"
     DATA_DIR.mkdir(exist_ok=True)
 
