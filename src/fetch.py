@@ -33,8 +33,6 @@ HEADERS = {
     "User-Agent": "kommuner-clustering/1.0 (portfolio; github.com/iamboehnke)",
 }
 
-# Forward: code -> name  e.g. {"101": "København"}
-# Reverse: name -> code  e.g. {"København": "101"}
 CODE_TO_NAME = MUNICIPALITY_NAMES
 NAME_TO_CODE = {v: k for k, v in MUNICIPALITY_NAMES.items()}
 VALID_CODES  = set(MUNICIPALITY_NAMES.keys())
@@ -46,6 +44,30 @@ VALID_CODES  = set(MUNICIPALITY_NAMES.keys())
 
 def _get_codes() -> list[str]:
     return list(MUNICIPALITY_NAMES.keys())
+
+
+def print_table_info(table: str) -> None:
+    """
+    Fetches table metadata and prints variable codes to the Actions log.
+    Called before fetches so any 400 errors are immediately diagnosable.
+    """
+    try:
+        r = requests.get(
+            f"{DST_INFO_API}/{table}",
+            params={"lang": "da", "format": "JSON"},
+            timeout=15,
+        )
+        if not r.ok:
+            print(f"  [meta] {table}: HTTP {r.status_code}")
+            return
+        info = r.json()
+        print(f"  [meta] {table}: {info.get('text', '')}")
+        for var in info.get("variables", []):
+            vals = [v["id"] for v in var.get("values", [])[:5]]
+            req  = "(REQUIRED)" if not var.get("elimination") else "(optional)"
+            print(f"    '{var['id']}' {req}: e.g. {vals}")
+    except Exception as e:
+        print(f"  [meta] {table}: {e}")
 
 
 def _dst_post(table: str, variables: list) -> pd.DataFrame:
@@ -92,16 +114,15 @@ def _to_numeric(series: pd.Series) -> pd.Series:
 def _resolve_kode(df: pd.DataFrame, col: str) -> pd.Series:
     """
     Resolves municipality codes from a DST text-label area column.
-
-    DST returns text labels like 'København', 'Frederiksberg' in the CSV.
+    DST returns text labels like 'København' in the CSV, not numeric codes.
     We reverse-lookup against our known municipality name->code mapping.
-    Unrecognised names get NaN (subsequently filtered out).
+    Unrecognised names get NaN and are subsequently filtered out.
     """
     return df[col].astype(str).str.strip().map(NAME_TO_CODE)
 
 
 # ---------------------------------------------------------------------------
-# Table fetchers
+# Table fetchers -- structural variables (used as clustering inputs)
 # ---------------------------------------------------------------------------
 
 def fetch_population(year: str = "2024K1") -> pd.DataFrame:
@@ -188,13 +209,11 @@ def fetch_income(year: str = "2022") -> pd.DataFrame:
     df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
     df["n"] = _to_numeric(df["INDHOLD"])
 
-    # Filter to: disposable income + mean income for all persons
-    indk_mask = df["INDKOMSTTYPE"].astype(str).str.startswith("1 ")
+    indk_mask  = df["INDKOMSTTYPE"].astype(str).str.startswith("1 ")
     enhed_mask = df["ENHED"].astype(str).str.contains("Gennemsnit for alle", na=False)
 
     df_m = df[indk_mask & enhed_mask].copy()
     if len(df_m) == 0:
-        # Fallback: any mean income row
         df_m = df[enhed_mask].copy()
     if len(df_m) == 0:
         df_m = df.copy()
@@ -227,10 +246,7 @@ def fetch_education(year: str = "2023") -> pd.DataFrame:
     df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
     df["n"] = _to_numeric(df["INDHOLD"])
 
-    # HFUDD codes H6x = medium cycle higher education, H7x = long cycle
-    hfudd_col = "HFUDD"
-    higher_mask = df[hfudd_col].astype(str).str.match(r"H[67]")
-
+    higher_mask = df["HFUDD"].astype(str).str.match(r"H[67]")
     totals = df.groupby("kode")["n"].sum().rename("edu_total")
     higher = df[higher_mask].groupby("kode")["n"].sum().rename("edu_higher")
 
@@ -260,7 +276,6 @@ def fetch_housing(year: str = "2023") -> pd.DataFrame:
     df["n"] = _to_numeric(df["INDHOLD"])
 
     social_mask = df["EJER"].astype(str).str.strip() == "Almene boligselskaber"
-
     totals = df.groupby("kode")["n"].sum().rename("dwellings_total")
     social = df[social_mask].groupby("kode")["n"].sum().rename("dwellings_social")
 
@@ -281,8 +296,6 @@ def fetch_geodata() -> dict:
     Fetches official Danish municipality boundaries from DAWA and simplifies
     the geometry to reduce file size.
 
-    DAWA provides 1:1000-scale precision (suitable for printed maps).
-    For a national-level web choropleth we only need ~1:100000 precision.
     Simplifying to 0.005 degree tolerance (~500m) reduces the file from
     ~150 MB to ~2 MB while looking identical at national zoom level.
     """
@@ -301,28 +314,75 @@ def fetch_geodata() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Master assembler
+# Master assembler -- structural variables
 # ---------------------------------------------------------------------------
 
+def build_dataset(cache: bool = True) -> pd.DataFrame:
+    """
+    Fetches all structural tables, joins by OMRÅDE, returns one row per
+    municipality. Caches to data/municipalities.parquet.
+    """
+    cache_path = DATA_DIR / "municipalities.parquet"
+    DATA_DIR.mkdir(exist_ok=True)
+
+    if cache and cache_path.exists():
+        print("[fetch] Loading from cache...")
+        return pd.read_parquet(cache_path)
+
+    print("[fetch] Fetching from DST API...")
+
+    steps = [
+        ("Population",   fetch_population),
+        ("Unemployment", fetch_unemployment),
+        ("Income",       fetch_income),
+        ("Education",    fetch_education),
+        ("Housing",      fetch_housing),
+    ]
+
+    base = None
+    failed = []
+    for name, fn in steps:
+        print(f"\n[fetch] {name}...")
+        try:
+            df = fn()
+            print(f"  -> {len(df)} rows")
+            base = df if base is None else base.merge(df, on="OMRÅDE", how="outer")
+        except Exception as e:
+            print(f"  WARNING: {name} failed: {e}")
+            failed.append(name)
+
+    if base is None or len(base) == 0:
+        raise RuntimeError(
+            f"No data loaded. Failed: {failed}. "
+            "Check the log above for details."
+        )
+    if failed:
+        print(f"\n[fetch] Partial data. Failed: {failed}. Clustering on available variables.")
+
+    base["municipality_code"] = base["OMRÅDE"].astype(str).str.zfill(4)
+
+    from src.municipalities import annotate
+    base = annotate(base)
+    base = base[base["OMRÅDE"].isin(VALID_CODES)].copy()
+
+    base.to_parquet(cache_path, index=False)
+    print(f"\n[fetch] Saved: {len(base)} municipalities, {len(base.columns)} columns")
+    return base
 
 
 # ---------------------------------------------------------------------------
 # Outcome variable fetchers
-# These are NOT used as clustering inputs -- they stay separate so the
-# cluster structure remains purely structural. They are used to compare
-# performance within clusters (peer benchmarking).
+# NOT used as clustering inputs -- kept separate so cluster structure is
+# purely structural. Used for within-cluster performance comparison.
 # ---------------------------------------------------------------------------
 
 def fetch_disability_pension(year: str = "2023") -> pd.DataFrame:
     """
     FORTS1: Recipients of disability pension (førtidspension) by municipality.
 
-    Returns share of working-age population (18-64) receiving disability pension.
-    This is one of the largest municipal social expenditure drivers and varies
-    significantly within structural peer groups -- making it a strong signal of
-    how well a municipality manages social inclusion.
-
-    Confirmed variable: BOPKOMMUNEDK (municipality of residence), not OMRÅDE.
+    Returns share of total population receiving disability pension.
+    One of the largest municipal social expenditure drivers; varies
+    significantly within structural peer groups.
     """
     codes = _get_codes()
     print_table_info("FORTS1")
@@ -334,7 +394,6 @@ def fetch_disability_pension(year: str = "2023") -> pd.DataFrame:
         {"code": "TID",          "values": [year]},
     ])
 
-    # BOPKOMMUNEDK returns text labels like FOLK1A -- reverse lookup
     omr_col = "BOPKOMMUNEDK" if "BOPKOMMUNEDK" in df.columns else df.columns[0]
     df["kode"] = _resolve_kode(df, omr_col)
     df = df[df["kode"].notna() & df["kode"].isin(VALID_CODES)].copy()
@@ -342,37 +401,37 @@ def fetch_disability_pension(year: str = "2023") -> pd.DataFrame:
 
     print(f"  FORTS1 YDELSE sample: {df['YDELSE'].unique()[:5].tolist()}")
 
-    # Total recipients across all disability pension types
     totals = df.groupby("kode")["n"].sum().rename("disability_pension_count")
 
-    # We need working-age population to compute the share
-    # Fetch from FOLK1A for the same year
     try:
         pop_df = fetch_population(year=f"{year}K1")
         pop_df = pop_df.rename(columns={"OMRÅDE": "kode"})
-        result = totals.reset_index().merge(pop_df[["kode", "pop_total"]], on="kode", how="left")
+        result = totals.reset_index().merge(
+            pop_df[["kode", "pop_total"]], on="kode", how="left"
+        )
         result["pct_disability_pension"] = (
             100 * result["disability_pension_count"] / result["pop_total"]
         ).round(2)
         print(f"  FORTS1: {len(result)} municipalities")
-        return result[["kode", "pct_disability_pension"]].rename(columns={"kode": "OMRÅDE"})
+        return result[["kode", "pct_disability_pension"]].rename(
+            columns={"kode": "OMRÅDE"}
+        )
     except Exception as e:
         print(f"  FORTS1: population join failed ({e}), returning raw counts")
         result = totals.reset_index()
         result["pct_disability_pension"] = result["disability_pension_count"]
-        return result[["kode", "pct_disability_pension"]].rename(columns={"kode": "OMRÅDE"})
+        return result[["kode", "pct_disability_pension"]].rename(
+            columns={"kode": "OMRÅDE"}
+        )
 
 
 def fetch_youth_education(year: str = "2022") -> pd.DataFrame:
     """
-    UNGEUDDU: Share of young people (15-24) enrolled in or having completed
+    UNGEUDDU: Share of young people enrolled in or having completed
     a youth education programme (ungdomsuddannelse).
 
-    This is directly tied to the national 95% target (95-procent-målsætningen):
-    the goal that 95% of young people complete a youth education. Progress
-    varies considerably by municipality and is a key policy priority.
-
-    Note: education completion data typically lags 1-2 years.
+    Tied to the national 95-procent-målsætningen. Varies considerably
+    by municipality and is a key policy priority.
     """
     codes = _get_codes()
     print_table_info("UNGEUDDU")
@@ -391,8 +450,7 @@ def fetch_youth_education(year: str = "2022") -> pd.DataFrame:
     print(f"  UNGEUDDU UDDANNELSE sample: {df['UDDANNELSE'].unique()[:5].tolist()}")
     print(f"  UNGEUDDU cols: {list(df.columns)}")
 
-    # Look for a percentage or "i gang/fuldfort" type row
-    udd_col = "UDDANNELSE" if "UDDANNELSE" in df.columns else df.columns[1]
+    udd_col  = "UDDANNELSE" if "UDDANNELSE" in df.columns else df.columns[1]
     pct_mask = df[udd_col].astype(str).str.lower().str.contains(
         "pct|procent|andel|igang|fuldført|i alt", na=False
     )
@@ -446,61 +504,11 @@ def fetch_outcomes(year: str = "2023", cache: bool = True) -> pd.DataFrame:
     return base
 
 
-
-    cache_path = DATA_DIR / "municipalities.parquet"
-    DATA_DIR.mkdir(exist_ok=True)
-
-    if cache and cache_path.exists():
-        print("[fetch] Loading from cache...")
-        return pd.read_parquet(cache_path)
-
-    print("[fetch] Fetching from DST API...")
-
-    steps = [
-        ("Population",   fetch_population),
-        ("Unemployment", fetch_unemployment),
-        ("Income",       fetch_income),
-        ("Education",    fetch_education),
-        ("Housing",      fetch_housing),
-    ]
-
-    base = None
-    failed = []
-    for name, fn in steps:
-        print(f"\n[fetch] {name}...")
-        try:
-            df = fn()
-            print(f"  -> {len(df)} rows")
-            base = df if base is None else base.merge(df, on="OMRÅDE", how="outer")
-        except Exception as e:
-            print(f"  WARNING: {name} failed: {e}")
-            failed.append(name)
-
-    if base is None or len(base) == 0:
-        raise RuntimeError(
-            f"No data loaded. Failed: {failed}. "
-            "Check the log above for details."
-        )
-    if failed:
-        print(f"\n[fetch] Partial data. Failed: {failed}. Clustering on available variables.")
-
-    base["municipality_code"] = base["OMRÅDE"].astype(str).str.zfill(4)
-
-    from src.municipalities import annotate
-    base = annotate(base)
-    base = base[base["OMRÅDE"].isin(VALID_CODES)].copy()
-
-    base.to_parquet(cache_path, index=False)
-    print(f"\n[fetch] Saved: {len(base)} municipalities, {len(base.columns)} columns")
-    return base
-
-
 # ---------------------------------------------------------------------------
 # Temporal fetch -- year-tagged builds
 # ---------------------------------------------------------------------------
 
-# Year specifications for temporal analysis.
-# AUP01 (unemployment) only starts from 2017M07, so 2017 is our baseline.
+# AUP01 (unemployment) only starts from 2017M07, so 2017 is the baseline.
 YEAR_SPECS = {
     "2017": {
         "folk1a": "2017K1",
@@ -522,9 +530,7 @@ YEAR_SPECS = {
 def build_dataset_for_year(year_tag: str, cache: bool = True) -> pd.DataFrame:
     """
     Fetches and assembles the full municipality dataset for a given year tag.
-
-    year_tag must be a key in YEAR_SPECS, e.g. "2017" or "2023".
-    Data is cached to data/municipalities_{year_tag}.parquet.
+    Cached to data/municipalities_{year_tag}.parquet.
     """
     if year_tag not in YEAR_SPECS:
         raise ValueError(f"Unknown year_tag '{year_tag}'. Choose from {list(YEAR_SPECS)}")
